@@ -1093,9 +1093,25 @@ function Test-TermsrvPatchPreflight {
         Write-Info "Selected signature matches: $matchCount"
 
         if ($matchCount -eq 0) {
-            Write-Error "Selected patch signature is not present in this termsrv.dll."
+            $osInfo = Get-OSInfo
+
+            Write-Title "COMPATIBILITY DIAGNOSTICS"
+
+            Write-Info "OS build:          $($osInfo.FullBuild)"
+            Write-Info "OS display version: $($osInfo.DisplayVersionFull)"
+            Write-Info "DLL version:       $dllVersion"
+            Write-Info "DLL SHA256:        $initialHash"
+            Write-Info "Candidate pattern: $($Pattern.Description)"
+            Write-Info "Candidate range:   $($Pattern.BuildRange.Min)-$($Pattern.BuildRange.Max)"
+            Write-Info "Signature matches: $matchCount"
+
+            Write-Warning "Diagnosis: the OS build selected this candidate pattern, but the installed termsrv.dll does not contain its expected search signature."
+            Write-Warning "The current repository compatibility rule is therefore too broad for this DLL revision."
+            Write-Warning "This DLL must remain unsupported until a compatible revision/signature is independently verified."
+
             Write-Error "Compatibility has NOT been verified for this DLL revision."
             Write-Error "No services, ACLs, or Windows protection/update settings were changed."
+
             return $false
         }
 
@@ -1460,18 +1476,18 @@ function Show-Menu {
 
 function Test-SystemCompatibility {
     Write-Title "COMPATIBILITY CHECK"
-    
+
     $pattern = Get-ApplicablePattern
     if ($null -eq $pattern) {
         return $false
     }
-    
+
     Write-Success "Using pattern: $($pattern.Description)"
-    
+
     if (Test-Path $termsrvPath) {
         $fileInfo = Get-Item $termsrvPath
         Write-Success "termsrv.dll found: $($fileInfo.Length) bytes"
-        
+
         if (Test-FileAccess $termsrvPath) {
             Write-Success "File is accessible"
         } else {
@@ -1481,10 +1497,18 @@ function Test-SystemCompatibility {
         Write-Error "termsrv.dll NOT found!"
         return $false
     }
-    
+
+    Write-Info "Running non-invasive termsrv.dll compatibility preflight..."
+
+    if (-not (Test-TermsrvPatchPreflight -DllPath $termsrvPath -Pattern $pattern)) {
+        Write-Warning "System compatibility check FAILED."
+        Write-Warning "The selected candidate pattern is not verified for the installed termsrv.dll."
+        return $false
+    }
+
+    Write-Success "System compatibility check PASSED."
     return $true
 }
-
 function Test-CurrentConfiguration {
     Write-Title "CONFIGURATION VALIDATION"
     
