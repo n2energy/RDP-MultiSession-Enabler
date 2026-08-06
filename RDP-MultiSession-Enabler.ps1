@@ -1695,7 +1695,7 @@ function New-SystemRestorePoint {
             -Description $description `
             -RestorePointType MODIFY_SETTINGS `
             -ErrorAction Stop `
-            -WarningAction Continue `
+            -WarningAction SilentlyContinue `
             -WarningVariable checkpointWarnings
 
         $afterPoints = @(Get-ComputerRestorePoint -ErrorAction SilentlyContinue)
@@ -1860,7 +1860,7 @@ do {
                         $null = New-SystemRestorePoint
                     }
                 }
-                Invoke-PatchApplication -Pattern $pattern -BackupPath $BackupPath
+                $null = Invoke-PatchApplication -Pattern $pattern -BackupPath $BackupPath
             }
             Write-Host "`n  Press any key to continue..." -ForegroundColor Cyan
             $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
@@ -1874,7 +1874,7 @@ do {
                         $null = New-SystemRestorePoint
                     }
                 }
-                Invoke-PatchApplication -Pattern $pattern -BackupPath $BackupPath -Persist
+                $null = Invoke-PatchApplication -Pattern $pattern -BackupPath $BackupPath -Persist
             }
             Write-Host "`n  Press any key to continue..." -ForegroundColor Cyan
             $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
