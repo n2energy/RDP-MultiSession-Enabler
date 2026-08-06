@@ -185,6 +185,19 @@ $patterns = @{
 }
 #endregion
 
+#region Known DLL Compatibility Identities
+
+$knownDllIdentities = @(
+    @{
+        Version = "10.0.26100.8115"
+        SHA256 = "22BA956A6AE345D0909825B5C1D5BF94E90241A9BBC9D92118E31EF33D7FBED9"
+        Status = "Unverified"
+        Notes = "Windows 11 25H2 host build 26200.8894; existing Win11_25H2 candidate search signature was not present."
+    }
+)
+
+#endregion
+
 #region Visualization Functions
 
 function Show-Header {
@@ -476,7 +489,7 @@ function Get-ApplicablePattern {
     
     if ($matchingPattern) {
         if (-not $Silent) {
-            Write-Success "Using pattern: $($matchingPattern.Description)"
+            Write-Info "Candidate pattern selected from OS build: $($matchingPattern.Description)"
             
             if ($matchingPattern.Warning) {
                 Write-Warning $matchingPattern.Warning
@@ -1042,6 +1055,21 @@ function Test-TermsrvPatchPreflight {
         Write-Info "termsrv.dll version: $dllVersion"
         Write-Info "termsrv.dll SHA256:  $initialHash"
 
+        $knownIdentity = $knownDllIdentities |
+            Where-Object {
+                $_.Version -eq $dllVersion -and
+                $_.SHA256 -eq $initialHash
+            } |
+            Select-Object -First 1
+
+        if ($null -ne $knownIdentity) {
+            Write-Warning "Known DLL identity detected"
+            Write-Info "Compatibility status: $($knownIdentity.Status)"
+            Write-Info "Identity notes: $($knownIdentity.Notes)"
+        } else {
+            Write-Info "DLL identity is not currently listed in the repository compatibility identity table."
+        }
+
         # ---------------------------------------------------------------------
         # Require an intact Microsoft-signed binary.
         # ---------------------------------------------------------------------
@@ -1107,7 +1135,15 @@ function Test-TermsrvPatchPreflight {
 
             Write-Warning "Diagnosis: the OS build selected this candidate pattern, but the installed termsrv.dll does not contain its expected search signature."
             Write-Warning "The current repository compatibility rule is therefore too broad for this DLL revision."
-            Write-Warning "This DLL must remain unsupported until a compatible revision/signature is independently verified."
+
+            if ($null -ne $knownIdentity) {
+                Write-Warning "This exact DLL version/hash is already recorded as: $($knownIdentity.Status)"
+                Write-Info "Recorded notes: $($knownIdentity.Notes)"
+            } else {
+                Write-Warning "This DLL identity has not previously been classified by this repository."
+            }
+
+            Write-Warning "No compatible binary-level signature has been verified for this DLL identity."
 
             Write-Error "Compatibility has NOT been verified for this DLL revision."
             Write-Error "No services, ACLs, or Windows protection/update settings were changed."
@@ -1482,7 +1518,7 @@ function Test-SystemCompatibility {
         return $false
     }
 
-    Write-Success "Using pattern: $($pattern.Description)"
+    Write-Info "Candidate pattern: $($pattern.Description)"
 
     if (Test-Path $termsrvPath) {
         $fileInfo = Get-Item $termsrvPath
