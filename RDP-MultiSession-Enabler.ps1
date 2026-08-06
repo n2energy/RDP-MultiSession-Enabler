@@ -185,6 +185,19 @@ $patterns = @{
 }
 #endregion
 
+#region Known DLL Compatibility Identities
+
+$knownDllIdentities = @(
+    @{
+        Version = "10.0.26100.8115"
+        SHA256 = "22BA956A6AE345D0909825B5C1D5BF94E90241A9BBC9D92118E31EF33D7FBED9"
+        Status = "Unverified"
+        Notes = "Windows 11 25H2 host build 26200.8894; existing Win11_25H2 candidate search signature was not present."
+    }
+)
+
+#endregion
+
 #region Visualization Functions
 
 function Show-Header {
@@ -476,7 +489,7 @@ function Get-ApplicablePattern {
     
     if ($matchingPattern) {
         if (-not $Silent) {
-            Write-Success "Using pattern: $($matchingPattern.Description)"
+            Write-Info "Candidate pattern selected from OS build: $($matchingPattern.Description)"
             
             if ($matchingPattern.Warning) {
                 Write-Warning $matchingPattern.Warning
@@ -991,6 +1004,186 @@ function Test-PatchValidity {
     return $allValid
 }
 
+function Test-TermsrvPatchPreflight {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DllPath,
+
+        [Parameter(Mandatory = $true)]
+        $Pattern
+    )
+
+    Write-Title "TERMSRV.DLL SAFETY PREFLIGHT"
+
+    if (-not (Test-Path -LiteralPath $DllPath -PathType Leaf)) {
+        Write-Error "termsrv.dll was not found at: $DllPath"
+        return $false
+    }
+
+    try {
+        # ---------------------------------------------------------------------
+        # Establish the exact file identity before doing anything invasive.
+        # ---------------------------------------------------------------------
+        $dllItem = Get-Item -LiteralPath $DllPath -ErrorAction Stop
+
+        $versionSource = $dllItem.VersionInfo.ProductVersion
+        if ([string]::IsNullOrWhiteSpace($versionSource)) {
+            $versionSource = $dllItem.VersionInfo.FileVersion
+        }
+
+        $versionMatch = [regex]::Match(
+            [string]$versionSource,
+            '\d+\.\d+\.\d+\.\d+'
+        )
+
+        if (-not $versionMatch.Success) {
+            Write-Error "Could not determine a four-part termsrv.dll version."
+            return $false
+        }
+
+        $dllVersion = $versionMatch.Value
+
+        $initialHash = (
+            Get-FileHash -LiteralPath $DllPath -Algorithm SHA256 -ErrorAction Stop
+        ).Hash.ToUpperInvariant()
+
+        if ($initialHash -notmatch '^[0-9A-F]{64}$') {
+            Write-Error "termsrv.dll SHA256 value is invalid."
+            return $false
+        }
+
+        Write-Info "termsrv.dll version: $dllVersion"
+        Write-Info "termsrv.dll SHA256:  $initialHash"
+
+        $knownIdentity = $knownDllIdentities |
+            Where-Object {
+                $_.Version -eq $dllVersion -and
+                $_.SHA256 -eq $initialHash
+            } |
+            Select-Object -First 1
+
+        if ($null -ne $knownIdentity) {
+            Write-Warning "Known DLL identity detected"
+            Write-Info "Compatibility status: $($knownIdentity.Status)"
+            Write-Info "Identity notes: $($knownIdentity.Notes)"
+        } else {
+            Write-Info "DLL identity is not currently listed in the repository compatibility identity table."
+        }
+
+        # ---------------------------------------------------------------------
+        # Require an intact Microsoft-signed binary.
+        # ---------------------------------------------------------------------
+        $auth = Get-AuthenticodeSignature -LiteralPath $DllPath -ErrorAction Stop
+
+        if ($auth.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+            Write-Error "Authenticode validation failed: $($auth.Status)"
+            return $false
+        }
+
+        if ($null -eq $auth.SignerCertificate) {
+            Write-Error "No signing certificate was returned for termsrv.dll."
+            return $false
+        }
+
+        $signerSubject = [string]$auth.SignerCertificate.Subject
+        Write-Info "Signer: $signerSubject"
+
+        if ($signerSubject -notmatch '(?i)Microsoft') {
+            Write-Error "termsrv.dll is validly signed, but not by Microsoft."
+            return $false
+        }
+
+        Write-Success "Microsoft Authenticode signature is valid"
+
+        # ---------------------------------------------------------------------
+        # Check the EXISTING selected pattern before TermService is stopped,
+        # ACLs are changed, or Windows protection/update settings are touched.
+        #
+        # No replacement/bypass patterns are introduced here.
+        # ---------------------------------------------------------------------
+        $dllBytes = [System.IO.File]::ReadAllBytes($DllPath)
+        $dllAsText = ($dllBytes | ForEach-Object {
+            $_.ToString('X2')
+        }) -join ' '
+
+        $matchCount = 0
+
+        if ($Pattern.Search -is [regex]) {
+            $matches = $Pattern.Search.Matches($dllAsText)
+            $matchCount = $matches.Count
+        }
+        else {
+            $literalPattern = [regex]::Escape([string]$Pattern.Search)
+            $matches = [regex]::Matches($dllAsText, $literalPattern)
+            $matchCount = $matches.Count
+        }
+
+        Write-Info "Selected signature matches: $matchCount"
+
+        if ($matchCount -eq 0) {
+            $osInfo = Get-OSInfo
+
+            Write-Title "COMPATIBILITY DIAGNOSTICS"
+
+            Write-Info "OS build:          $($osInfo.FullBuild)"
+            Write-Info "OS display version: $($osInfo.DisplayVersionFull)"
+            Write-Info "DLL version:       $dllVersion"
+            Write-Info "DLL SHA256:        $initialHash"
+            Write-Info "Candidate pattern: $($Pattern.Description)"
+            Write-Info "Candidate range:   $($Pattern.BuildRange.Min)-$($Pattern.BuildRange.Max)"
+            Write-Info "Signature matches: $matchCount"
+
+            Write-Warning "Diagnosis: the OS build selected this candidate pattern, but the installed termsrv.dll does not contain its expected search signature."
+            Write-Warning "The current repository compatibility rule is therefore too broad for this DLL revision."
+
+            if ($null -ne $knownIdentity) {
+                Write-Warning "This exact DLL version/hash is already recorded as: $($knownIdentity.Status)"
+                Write-Info "Recorded notes: $($knownIdentity.Notes)"
+            } else {
+                Write-Warning "This DLL identity has not previously been classified by this repository."
+            }
+
+            Write-Warning "No compatible binary-level signature has been verified for this DLL identity."
+
+            Write-Error "Compatibility has NOT been verified for this DLL revision."
+            Write-Error "No services, ACLs, or Windows protection/update settings were changed."
+
+            return $false
+        }
+
+        if ($matchCount -ne 1) {
+            Write-Error "Selected patch signature is ambiguous ($matchCount matches)."
+            Write-Error "Refusing to continue."
+            return $false
+        }
+
+        Write-Success "Selected patch signature exists exactly once"
+
+        # ---------------------------------------------------------------------
+        # Re-hash after inspection to ensure the file did not change during
+        # preflight.
+        # ---------------------------------------------------------------------
+        $finalHash = (
+            Get-FileHash -LiteralPath $DllPath -Algorithm SHA256 -ErrorAction Stop
+        ).Hash.ToUpperInvariant()
+
+        if ($finalHash -ne $initialHash) {
+            Write-Error "termsrv.dll changed while preflight validation was running."
+            Write-Error "Initial SHA256: $initialHash"
+            Write-Error "Final SHA256:   $finalHash"
+            return $false
+        }
+
+        Write-Success "termsrv.dll identity remained stable during preflight"
+        Write-Success "Safety preflight passed"
+
+        return $true
+    }
+    catch {
+        Write-Error "termsrv.dll safety preflight failed: $_"
+        return $false
+    }
+}
 function Invoke-PatchApplication {
     param(
         $Pattern,
@@ -1013,6 +1206,13 @@ function Invoke-PatchApplication {
         }
     }
     
+    # Fail closed before stopping services, changing ACLs, or modifying
+    # Windows protection/update settings.
+    if (-not (Test-TermsrvPatchPreflight -DllPath $termsrvPath -Pattern $Pattern)) {
+        Write-Error "Safety preflight failed. No invasive changes have been made."
+        return $false
+    }
+
     # Disable Windows File Protection
     Disable-WindowsFileProtection
     
@@ -1312,18 +1512,18 @@ function Show-Menu {
 
 function Test-SystemCompatibility {
     Write-Title "COMPATIBILITY CHECK"
-    
+
     $pattern = Get-ApplicablePattern
     if ($null -eq $pattern) {
         return $false
     }
-    
-    Write-Success "Using pattern: $($pattern.Description)"
-    
+
+    Write-Info "Candidate pattern: $($pattern.Description)"
+
     if (Test-Path $termsrvPath) {
         $fileInfo = Get-Item $termsrvPath
         Write-Success "termsrv.dll found: $($fileInfo.Length) bytes"
-        
+
         if (Test-FileAccess $termsrvPath) {
             Write-Success "File is accessible"
         } else {
@@ -1333,10 +1533,18 @@ function Test-SystemCompatibility {
         Write-Error "termsrv.dll NOT found!"
         return $false
     }
-    
+
+    Write-Info "Running non-invasive termsrv.dll compatibility preflight..."
+
+    if (-not (Test-TermsrvPatchPreflight -DllPath $termsrvPath -Pattern $pattern)) {
+        Write-Warning "System compatibility check FAILED."
+        Write-Warning "The selected candidate pattern is not verified for the installed termsrv.dll."
+        return $false
+    }
+
+    Write-Success "System compatibility check PASSED."
     return $true
 }
-
 function Test-CurrentConfiguration {
     Write-Title "CONFIGURATION VALIDATION"
     
@@ -1527,21 +1735,60 @@ function Test-MultiSessionCapability {
 function New-SystemRestorePoint {
     Write-Title "SYSTEM RESTORE"
     Write-Info "Creating System Restore Point..."
-    
+
     try {
         $description = "Pre-RDP Multi-Session Patch $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
-        Checkpoint-Computer -Description $description -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
-        
+
+        $beforePoints = @(Get-ComputerRestorePoint -ErrorAction SilentlyContinue)
+        $beforeMaxSequence = -1
+
+        if ($beforePoints.Count -gt 0) {
+            $beforeMaxSequence = [int64]((
+                $beforePoints |
+                Measure-Object -Property SequenceNumber -Maximum
+            ).Maximum)
+        }
+
+        $checkpointWarnings = @()
+
+        Checkpoint-Computer `
+            -Description $description `
+            -RestorePointType MODIFY_SETTINGS `
+            -ErrorAction Stop `
+            -WarningAction SilentlyContinue `
+            -WarningVariable checkpointWarnings
+
+        $afterPoints = @(Get-ComputerRestorePoint -ErrorAction SilentlyContinue)
+
+        $newPoint = $afterPoints |
+            Where-Object { [int64]$_.SequenceNumber -gt $beforeMaxSequence } |
+            Sort-Object SequenceNumber -Descending |
+            Select-Object -First 1
+
+        if ($null -eq $newPoint) {
+            Write-Warning "System Restore Point was not created."
+
+            foreach ($warningMessage in $checkpointWarnings) {
+                Write-Warning ([string]$warningMessage)
+            }
+
+            if ($checkpointWarnings.Count -eq 0) {
+                Write-Warning "Checkpoint-Computer returned without an error, but no new restore point could be verified."
+            }
+
+            return $false
+        }
+
         Write-Success "System Restore Point created successfully"
-        Write-Info "Description: $description"
+        Write-Info "Description: $($newPoint.Description)"
+        Write-Info "Sequence number: $($newPoint.SequenceNumber)"
         return $true
     } catch {
         Write-Warning "Failed to create System Restore Point: $_"
-        Write-Info "You may need to enable System Restore first"
+        Write-Info "Check Windows System Protection configuration and available restore-point storage."
         return $false
     }
 }
-
 function Get-RDPSessions {
     Write-Title "ACTIVE SESSIONS"
     
@@ -1601,7 +1848,7 @@ if (-not ($Check -or $Validate -or $Test)) {
 }
 
 if ($Check) {
-    Test-SystemCompatibility
+    $null = Test-SystemCompatibility
     Stop-TranscriptLogging
     exit 0
 }
@@ -1627,7 +1874,7 @@ if ($Patch) {
         if (-not $Force) {
             $response = Read-Host "`n  Do you want to create a System Restore Point first? (Y/n)"
             if ($response -ne 'n' -and $response -ne 'N') {
-                New-SystemRestorePoint
+                $null = New-SystemRestorePoint
             }
         }
         
@@ -1655,7 +1902,7 @@ do {
     
     switch ($choice) {
         "1" { 
-            Test-SystemCompatibility
+            $null = Test-SystemCompatibility
             Write-Host "`n  Press any key to continue..." -ForegroundColor Cyan
             $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
         }
@@ -1670,10 +1917,10 @@ do {
                 if (-not $Force) {
                     $response = Read-Host "`n  Do you want to create a System Restore Point first? (Y/n)"
                     if ($response -ne 'n' -and $response -ne 'N') {
-                        New-SystemRestorePoint
+                        $null = New-SystemRestorePoint
                     }
                 }
-                Invoke-PatchApplication -Pattern $pattern -BackupPath $BackupPath
+                $null = Invoke-PatchApplication -Pattern $pattern -BackupPath $BackupPath
             }
             Write-Host "`n  Press any key to continue..." -ForegroundColor Cyan
             $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
@@ -1684,10 +1931,10 @@ do {
                 if (-not $Force) {
                     $response = Read-Host "`n  Do you want to create a System Restore Point first? (Y/n)"
                     if ($response -ne 'n' -and $response -ne 'N') {
-                        New-SystemRestorePoint
+                        $null = New-SystemRestorePoint
                     }
                 }
-                Invoke-PatchApplication -Pattern $pattern -BackupPath $BackupPath -Persist
+                $null = Invoke-PatchApplication -Pattern $pattern -BackupPath $BackupPath -Persist
             }
             Write-Host "`n  Press any key to continue..." -ForegroundColor Cyan
             $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
@@ -1698,7 +1945,7 @@ do {
             $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
         }
         "6" {
-            New-SystemRestorePoint
+            $null = New-SystemRestorePoint
             Write-Host "`n  Press any key to continue..." -ForegroundColor Cyan
             $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
         }
