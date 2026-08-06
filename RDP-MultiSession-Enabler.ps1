@@ -1812,7 +1812,7 @@ if (-not ($Check -or $Validate -or $Test)) {
 }
 
 if ($Check) {
-    Test-SystemCompatibility
+    $null = Test-SystemCompatibility
     Stop-TranscriptLogging
     exit 0
 }
@@ -1866,7 +1866,7 @@ do {
     
     switch ($choice) {
         "1" { 
-            Test-SystemCompatibility
+            $null = Test-SystemCompatibility
             Write-Host "`n  Press any key to continue..." -ForegroundColor Cyan
             $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
         }
