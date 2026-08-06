@@ -991,6 +991,147 @@ function Test-PatchValidity {
     return $allValid
 }
 
+function Test-TermsrvPatchPreflight {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DllPath,
+
+        [Parameter(Mandatory = $true)]
+        $Pattern
+    )
+
+    Write-Title "TERMSRV.DLL SAFETY PREFLIGHT"
+
+    if (-not (Test-Path -LiteralPath $DllPath -PathType Leaf)) {
+        Write-Error "termsrv.dll was not found at: $DllPath"
+        return $false
+    }
+
+    try {
+        # ---------------------------------------------------------------------
+        # Establish the exact file identity before doing anything invasive.
+        # ---------------------------------------------------------------------
+        $dllItem = Get-Item -LiteralPath $DllPath -ErrorAction Stop
+
+        $versionSource = $dllItem.VersionInfo.ProductVersion
+        if ([string]::IsNullOrWhiteSpace($versionSource)) {
+            $versionSource = $dllItem.VersionInfo.FileVersion
+        }
+
+        $versionMatch = [regex]::Match(
+            [string]$versionSource,
+            '\d+\.\d+\.\d+\.\d+'
+        )
+
+        if (-not $versionMatch.Success) {
+            Write-Error "Could not determine a four-part termsrv.dll version."
+            return $false
+        }
+
+        $dllVersion = $versionMatch.Value
+
+        $initialHash = (
+            Get-FileHash -LiteralPath $DllPath -Algorithm SHA256 -ErrorAction Stop
+        ).Hash.ToUpperInvariant()
+
+        if ($initialHash -notmatch '^[0-9A-F]{64}$') {
+            Write-Error "termsrv.dll SHA256 value is invalid."
+            return $false
+        }
+
+        Write-Info "termsrv.dll version: $dllVersion"
+        Write-Info "termsrv.dll SHA256:  $initialHash"
+
+        # ---------------------------------------------------------------------
+        # Require an intact Microsoft-signed binary.
+        # ---------------------------------------------------------------------
+        $auth = Get-AuthenticodeSignature -LiteralPath $DllPath -ErrorAction Stop
+
+        if ($auth.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+            Write-Error "Authenticode validation failed: $($auth.Status)"
+            return $false
+        }
+
+        if ($null -eq $auth.SignerCertificate) {
+            Write-Error "No signing certificate was returned for termsrv.dll."
+            return $false
+        }
+
+        $signerSubject = [string]$auth.SignerCertificate.Subject
+        Write-Info "Signer: $signerSubject"
+
+        if ($signerSubject -notmatch '(?i)Microsoft') {
+            Write-Error "termsrv.dll is validly signed, but not by Microsoft."
+            return $false
+        }
+
+        Write-Success "Microsoft Authenticode signature is valid"
+
+        # ---------------------------------------------------------------------
+        # Check the EXISTING selected pattern before TermService is stopped,
+        # ACLs are changed, or Windows protection/update settings are touched.
+        #
+        # No replacement/bypass patterns are introduced here.
+        # ---------------------------------------------------------------------
+        $dllBytes = [System.IO.File]::ReadAllBytes($DllPath)
+        $dllAsText = ($dllBytes | ForEach-Object {
+            $_.ToString('X2')
+        }) -join ' '
+
+        $matchCount = 0
+
+        if ($Pattern.Search -is [regex]) {
+            $matches = $Pattern.Search.Matches($dllAsText)
+            $matchCount = $matches.Count
+        }
+        else {
+            $literalPattern = [regex]::Escape([string]$Pattern.Search)
+            $matches = [regex]::Matches($dllAsText, $literalPattern)
+            $matchCount = $matches.Count
+        }
+
+        Write-Info "Selected signature matches: $matchCount"
+
+        if ($matchCount -eq 0) {
+            Write-Error "Selected patch signature is not present in this termsrv.dll."
+            Write-Error "Compatibility has NOT been verified for this DLL revision."
+            Write-Error "No services, ACLs, or Windows protection/update settings were changed."
+            return $false
+        }
+
+        if ($matchCount -ne 1) {
+            Write-Error "Selected patch signature is ambiguous ($matchCount matches)."
+            Write-Error "Refusing to continue."
+            return $false
+        }
+
+        Write-Success "Selected patch signature exists exactly once"
+
+        # ---------------------------------------------------------------------
+        # Re-hash after inspection to ensure the file did not change during
+        # preflight.
+        # ---------------------------------------------------------------------
+        $finalHash = (
+            Get-FileHash -LiteralPath $DllPath -Algorithm SHA256 -ErrorAction Stop
+        ).Hash.ToUpperInvariant()
+
+        if ($finalHash -ne $initialHash) {
+            Write-Error "termsrv.dll changed while preflight validation was running."
+            Write-Error "Initial SHA256: $initialHash"
+            Write-Error "Final SHA256:   $finalHash"
+            return $false
+        }
+
+        Write-Success "termsrv.dll identity remained stable during preflight"
+        Write-Success "Safety preflight passed"
+
+        return $true
+    }
+    catch {
+        Write-Error "termsrv.dll safety preflight failed: $_"
+        return $false
+    }
+}
 function Invoke-PatchApplication {
     param(
         $Pattern,
@@ -1013,6 +1154,13 @@ function Invoke-PatchApplication {
         }
     }
     
+    # Fail closed before stopping services, changing ACLs, or modifying
+    # Windows protection/update settings.
+    if (-not (Test-TermsrvPatchPreflight -DllPath $termsrvPath -Pattern $Pattern)) {
+        Write-Error "Safety preflight failed. No invasive changes have been made."
+        return $false
+    }
+
     # Disable Windows File Protection
     Disable-WindowsFileProtection
     
