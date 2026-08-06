@@ -1675,21 +1675,60 @@ function Test-MultiSessionCapability {
 function New-SystemRestorePoint {
     Write-Title "SYSTEM RESTORE"
     Write-Info "Creating System Restore Point..."
-    
+
     try {
         $description = "Pre-RDP Multi-Session Patch $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
-        Checkpoint-Computer -Description $description -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
-        
+
+        $beforePoints = @(Get-ComputerRestorePoint -ErrorAction SilentlyContinue)
+        $beforeMaxSequence = -1
+
+        if ($beforePoints.Count -gt 0) {
+            $beforeMaxSequence = [int64]((
+                $beforePoints |
+                Measure-Object -Property SequenceNumber -Maximum
+            ).Maximum)
+        }
+
+        $checkpointWarnings = @()
+
+        Checkpoint-Computer `
+            -Description $description `
+            -RestorePointType MODIFY_SETTINGS `
+            -ErrorAction Stop `
+            -WarningAction Continue `
+            -WarningVariable checkpointWarnings
+
+        $afterPoints = @(Get-ComputerRestorePoint -ErrorAction SilentlyContinue)
+
+        $newPoint = $afterPoints |
+            Where-Object { [int64]$_.SequenceNumber -gt $beforeMaxSequence } |
+            Sort-Object SequenceNumber -Descending |
+            Select-Object -First 1
+
+        if ($null -eq $newPoint) {
+            Write-Warning "System Restore Point was not created."
+
+            foreach ($warningMessage in $checkpointWarnings) {
+                Write-Warning ([string]$warningMessage)
+            }
+
+            if ($checkpointWarnings.Count -eq 0) {
+                Write-Warning "Checkpoint-Computer returned without an error, but no new restore point could be verified."
+            }
+
+            return $false
+        }
+
         Write-Success "System Restore Point created successfully"
-        Write-Info "Description: $description"
+        Write-Info "Description: $($newPoint.Description)"
+        Write-Info "Sequence number: $($newPoint.SequenceNumber)"
         return $true
     } catch {
         Write-Warning "Failed to create System Restore Point: $_"
-        Write-Info "You may need to enable System Restore first"
+        Write-Info "Check Windows System Protection configuration and available restore-point storage."
         return $false
     }
 }
-
 function Get-RDPSessions {
     Write-Title "ACTIVE SESSIONS"
     
@@ -1775,7 +1814,7 @@ if ($Patch) {
         if (-not $Force) {
             $response = Read-Host "`n  Do you want to create a System Restore Point first? (Y/n)"
             if ($response -ne 'n' -and $response -ne 'N') {
-                New-SystemRestorePoint
+                $null = New-SystemRestorePoint
             }
         }
         
@@ -1818,7 +1857,7 @@ do {
                 if (-not $Force) {
                     $response = Read-Host "`n  Do you want to create a System Restore Point first? (Y/n)"
                     if ($response -ne 'n' -and $response -ne 'N') {
-                        New-SystemRestorePoint
+                        $null = New-SystemRestorePoint
                     }
                 }
                 Invoke-PatchApplication -Pattern $pattern -BackupPath $BackupPath
@@ -1832,7 +1871,7 @@ do {
                 if (-not $Force) {
                     $response = Read-Host "`n  Do you want to create a System Restore Point first? (Y/n)"
                     if ($response -ne 'n' -and $response -ne 'N') {
-                        New-SystemRestorePoint
+                        $null = New-SystemRestorePoint
                     }
                 }
                 Invoke-PatchApplication -Pattern $pattern -BackupPath $BackupPath -Persist
@@ -1846,7 +1885,7 @@ do {
             $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
         }
         "6" {
-            New-SystemRestorePoint
+            $null = New-SystemRestorePoint
             Write-Host "`n  Press any key to continue..." -ForegroundColor Cyan
             $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
         }
